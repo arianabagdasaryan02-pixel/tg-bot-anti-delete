@@ -13,20 +13,20 @@ Telegram-бот, который отслеживает **удалённые** и
 - Python 3.10+
 - [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot) v21+
 - Telegram Bot Token (через [@BotFather](https://t.me/BotFather))
+- **Включённый Secretary Mode (Режим секретаря)** в настройках бота у [@BotFather](https://t.me/BotFather). Без него Telegram не позволит привязать бота в меню автоматизации чатов.
 - Подключение бота как Business Bot в настройках Telegram-аккаунта
 
 ## Установка
 
 ```bash
-git clone https://github.com/<YOUR_USERNAME>/telegram-business-spy-bot.git
-cd telegram-business-spy-bot
+git clone [https://github.com/arianabagdasaryan02-pixel/tg-bot-anti-delete.git](https://github.com/arianabagdasaryan02-pixel/tg-bot-anti-delete.git)
+cd tg-bot-anti-delete
 
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 
 pip install -r requirements.txt
 ```
-
 ## Настройка
 
 1. Скопируйте пример конфига:
@@ -39,10 +39,13 @@ cp config.example.py config.py
 
 ```python
 BOT_TOKEN = "123456:ABC-..."
+BOT_USERNAME = "your_bot_username"  # ВАЖНО: указывайте имя бота строго БЕЗ символа @
 ```
 
 3. Подключите бота к своему Telegram-аккаунту:
-   - Откройте профиль → «Изменить» → «Автоматизация чатов»
+   - Перейдите в @BotFather -> /mybots -> выберите вашего бота -> Bot Settings -> Mode Settings.
+   - Убедитесь, что тумблер Secretary Mode переведен в состояние ON (включен).
+   - Откройте свой личный профиль в Telegram -> «Изменить» (Settings) -> «Автоматизация чатов» (Telegram Business).
    - Найдите и добавьте вашего бота
 
 ## Запуск
