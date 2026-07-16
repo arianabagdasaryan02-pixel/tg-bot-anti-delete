@@ -1,0 +1,8 @@
+config.py
+messages.db
+media_archive/
+*.log
+venv/
+.venv/
+__pycache__/
+*.pyc
