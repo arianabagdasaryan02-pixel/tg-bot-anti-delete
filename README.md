@@ -1,7 +1,13 @@
-# 🗑 Telegram Business Deleted & Edited Messages Bot
+Telegram Anti-Delete & Edit Messages bot
 
 Telegram-бот, который отслеживает **удалённые** и **отредактированные** сообщения в личных чатах через [Telegram Business API](https://core.telegram.org/bots/features#business-mode).
 
+## 📸 Демонстрация работы
+Ниже представлен пример того, как бот перехватывает удалённые сообщения от разных пользователей и наглядно фиксирует изменения текста в формате «Было / Стало»: 
+
+<p align="center">
+  <img src="demo.png" alt="Пример работы созданного бота с именем Самозванец @kkkrylya_bot" width="400">
+</p>
 
 ## Что умеет
 
