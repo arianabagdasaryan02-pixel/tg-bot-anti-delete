@@ -61,6 +61,8 @@ def init_db():
             thumb_path TEXT,
             media_size INTEGER,
             media_duration INTEGER,
+            media_file_name TEXT,
+            media_mime_type TEXT,
             too_big INTEGER DEFAULT 0,
             date TEXT,
             PRIMARY KEY (business_connection_id, chat_id, message_id)
@@ -84,6 +86,8 @@ def init_db():
         "thumb_path TEXT",
         "media_size INTEGER",
         "media_duration INTEGER",
+        "media_file_name TEXT",
+        "media_mime_type TEXT",
         "too_big INTEGER DEFAULT 0",
     )
     for col in message_columns:
@@ -119,6 +123,8 @@ def save_message(**fields):
         "thumb_path": None,
         "media_size": 0,
         "media_duration": None,
+        "media_file_name": None,
+        "media_mime_type": None,
         "too_big": 0,
         "date": datetime.now().isoformat(),
     }
@@ -131,11 +137,13 @@ def save_message(**fields):
         (business_connection_id, chat_id, message_id, chat_title,
          sender_id, sender_name, sender_username, text,
          media_type, media_file_id, media_unique_id, media_path,
-         thumb_file_id, thumb_path, media_size, media_duration, too_big, date)
+         thumb_file_id, thumb_path, media_size, media_duration,
+         media_file_name, media_mime_type, too_big, date)
         VALUES (:bc_id, :chat_id, :message_id, :chat_title,
                 :sender_id, :sender_name, :sender_username, :text,
                 :media_type, :media_file_id, :media_unique_id, :media_path,
-                :thumb_file_id, :thumb_path, :media_size, :media_duration, :too_big, :date)
+                :thumb_file_id, :thumb_path, :media_size, :media_duration,
+                :media_file_name, :media_mime_type, :too_big, :date)
         """,
         defaults,
     )
@@ -148,7 +156,8 @@ def get_message(bc_id, chat_id, message_id):
     cur = conn.execute(
         "SELECT text, sender_name, sender_username, chat_title, "
         "media_type, media_file_id, media_unique_id, media_path, "
-        "thumb_file_id, thumb_path, media_size, media_duration, too_big, sender_id "
+        "thumb_file_id, thumb_path, media_size, media_duration, "
+        "media_file_name, media_mime_type, too_big, sender_id "
         "FROM messages WHERE business_connection_id=? AND chat_id=? AND message_id=?",
         (bc_id, chat_id, message_id),
     )
@@ -166,7 +175,8 @@ def get_deleted_batch(bc_id, chat_id, message_ids):
     cur = conn.execute(
         f"SELECT message_id, text, sender_name, sender_username, chat_title, "
         f"media_type, media_file_id, media_path, thumb_file_id, thumb_path, "
-        f"media_size, media_duration, too_big, sender_id "
+        f"media_size, media_duration, media_file_name, media_mime_type, "
+        f"too_big, sender_id "
         f"FROM messages WHERE business_connection_id=? AND chat_id=? "
         f"AND message_id IN ({placeholders})",
         (bc_id, chat_id, *message_ids),
@@ -264,7 +274,8 @@ MEDIA_ATTRS = (
 
 
 def extract_media(msg):
-    """Вернуть type, file_id, file_unique_id, thumb_file_id, size, duration."""
+    """Вернуть type, file_id, file_unique_id, thumb_file_id, size, duration,
+    file_name и mime_type — чтобы отдать пользователю тот же файл, что он послал."""
     info = {
         "type": None,
         "file_id": None,
@@ -272,6 +283,8 @@ def extract_media(msg):
         "thumb_file_id": None,
         "size": 0,
         "duration": None,
+        "file_name": None,
+        "mime_type": None,
     }
 
     if msg.photo:
@@ -290,7 +303,14 @@ def extract_media(msg):
         m = getattr(msg, attr, None)
         if not m:
             continue
-        info.update(type=attr, file_id=m.file_id, unique_id=m.file_unique_id, size=m.file_size or 0)
+        info.update(
+            type=attr,
+            file_id=m.file_id,
+            unique_id=m.file_unique_id,
+            size=m.file_size or 0,
+            file_name=getattr(m, "file_name", None),
+            mime_type=getattr(m, "mime_type", None),
+        )
         if attr in MEDIA_ATTRS_WITH_DURATION:
             info["duration"] = getattr(m, "duration", None)
         thumb = getattr(m, "thumbnail", None)
@@ -674,6 +694,8 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         thumb_path=thumb_path,
         media_size=info["size"],
         media_duration=info["duration"],
+        media_file_name=info["file_name"],
+        media_mime_type=info["mime_type"],
         too_big=too_big,
         date=datetime.now().isoformat(),
     )
@@ -701,6 +723,8 @@ async def on_edited_business_message(update: Update, context: ContextTypes.DEFAU
     old_media_path = None
     old_thumb_file_id = None
     old_thumb_path = None
+    old_media_file_name = None
+    old_media_mime_type = None
     old_too_big = 0
 
     if old and owner:
@@ -717,6 +741,8 @@ async def on_edited_business_message(update: Update, context: ContextTypes.DEFAU
             old_thumb_path,
             _old_size,
             _old_dur,
+            old_media_file_name,
+            old_media_mime_type,
             old_too_big,
             old_sender_id,
         ) = old
@@ -761,6 +787,8 @@ async def on_edited_business_message(update: Update, context: ContextTypes.DEFAU
                         old_thumb_path,
                         old_thumb_file_id,
                         report,
+                        old_media_file_name,
+                        old_media_mime_type,
                     )
                 else:
                     await _send_text_report(context.bot, owner, report)
@@ -783,6 +811,8 @@ async def on_edited_business_message(update: Update, context: ContextTypes.DEFAU
         thumb_file_id = old_thumb_file_id
         thumb_path = old_thumb_path
         too_big = old_too_big
+        media_file_name = old_media_file_name
+        media_mime_type = old_media_mime_type
     elif new_info["file_id"]:
         media_file_id = new_info["file_id"]
         thumb_file_id = new_info["thumb_file_id"]
@@ -793,12 +823,16 @@ async def on_edited_business_message(update: Update, context: ContextTypes.DEFAU
             msg.chat.id,
             msg.message_id,
         )
+        media_file_name = new_info["file_name"]
+        media_mime_type = new_info["mime_type"]
     else:
         media_file_id = None
         media_path = None
         thumb_file_id = None
         thumb_path = None
         too_big = 0
+        media_file_name = None
+        media_mime_type = None
 
     save_message(
         bc_id=msg.business_connection_id,
@@ -817,6 +851,8 @@ async def on_edited_business_message(update: Update, context: ContextTypes.DEFAU
         thumb_path=thumb_path,
         media_size=new_info["size"],
         media_duration=new_info["duration"],
+        media_file_name=media_file_name,
+        media_mime_type=media_mime_type,
         too_big=too_big,
         date=datetime.now().isoformat(),
     )
@@ -842,15 +878,100 @@ def _caption_kwargs_or_none(caption):
     return {"caption": caption, "parse_mode": "HTML"}
 
 
-async def _send_media(bot, chat_id, media_type, source, caption):
+# Резервные расширения для случаев, когда Telegram не отдал file_name (voice, video_note
+# и иногда голосовые/видео, отправленные из веб-клиента).
+_DEFAULT_EXTENSIONS = {
+    "photo": ".jpg",
+    "video": ".mp4",
+    "video_note": ".mp4",
+    "voice": ".ogg",
+    "audio": ".mp3",
+    "animation": ".mp4",
+    "document": "",
+    "sticker": ".webp",
+}
+
+_MIME_EXTENSIONS = {
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".opus",
+    "audio/x-wav": ".wav",
+    "audio/wav": ".wav",
+    "audio/x-m4a": ".m4a",
+    "audio/mp4": ".m4a",
+    "audio/aac": ".aac",
+    "audio/flac": ".flac",
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/webm": ".webm",
+    "video/x-matroska": ".mkv",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "application/pdf": ".pdf",
+    "application/zip": ".zip",
+    "application/x-rar-compressed": ".rar",
+    "application/x-7z-compressed": ".7z",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.ms-powerpoint": ".ppt",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "text/plain": ".txt",
+}
+
+
+def _resolve_display_filename(media_type, file_name, mime_type):
+    """
+    Имя файла, которое увидит владелец business-подключения.
+    Восстанавливаем оригинал (Ruslan_resume.pdf), а если Telegram имя не дал —
+    собираем осмысленный fallback с расширением по MIME/типу медиа.
+    """
+    if file_name:
+        return file_name
+
+    ext = _MIME_EXTENSIONS.get((mime_type or "").lower(), "")
+    if not ext:
+        ext = _DEFAULT_EXTENSIONS.get(media_type, "")
+
+    base = {
+        "photo": "photo",
+        "video": "video",
+        "video_note": "video_note",
+        "voice": "voice",
+        "audio": "audio",
+        "animation": "animation",
+        "sticker": "sticker",
+        "document": "file",
+    }.get(media_type, "file")
+
+    return f"{base}{ext}"
+
+
+async def _send_media(bot, chat_id, media_type, source, caption,
+                       file_name=None, mime_type=None):
     """
     Отправить медиа с подписью (или отдельным текстом, если нельзя).
     `source` — открытый файловый объект (локальный оригинал) или file_id (строка).
+    `file_name` / `mime_type` — метаданные исходного файла, чтобы владелец
+    увидел ровно тот файл, который прислали, а не `bc_..._document`.
     """
     caption_kwargs = _caption_kwargs_or_none(caption)
     if caption_kwargs is None:
         await _send_text_report(bot, chat_id, caption)
         caption_kwargs = {}
+
+    # filename имеет смысл только для локального файла — при отправке по file_id
+    # Telegram использует своё оригинальное имя.
+    is_upload = not isinstance(source, str)
+    filename_kwargs = {}
+    if is_upload:
+        filename_kwargs["filename"] = _resolve_display_filename(
+            media_type, file_name, mime_type
+        )
 
     senders = {
         "photo": bot.send_photo,
@@ -861,7 +982,7 @@ async def _send_media(bot, chat_id, media_type, source, caption):
     }
     sender = senders.get(media_type)
     if sender:
-        await sender(chat_id, source, **caption_kwargs)
+        await sender(chat_id, source, **caption_kwargs, **filename_kwargs)
         return
 
     if media_type in ("video_note", "sticker"):
@@ -870,16 +991,18 @@ async def _send_media(bot, chat_id, media_type, source, caption):
         if hasattr(source, "seek"):
             source.seek(0)
         if media_type == "video_note":
-            await bot.send_video_note(chat_id, source)
+            await bot.send_video_note(chat_id, source, **filename_kwargs)
         else:
+            # У stickers filename не влияет на отображение, но не мешает.
             await bot.send_sticker(chat_id, source)
         return
 
-    await bot.send_document(chat_id, source, **caption_kwargs)
+    await bot.send_document(chat_id, source, **caption_kwargs, **filename_kwargs)
 
 
 async def _send_stored_media(bot, chat_id, media_type, media_path, media_file_id,
-                              thumb_path, thumb_file_id, caption):
+                              thumb_path, thumb_file_id, caption,
+                              file_name=None, mime_type=None):
     """
     Порядок отправки:
     1. локально сохранённый оригинал;
@@ -891,14 +1014,20 @@ async def _send_stored_media(bot, chat_id, media_type, media_path, media_file_id
     if media_path and os.path.exists(media_path):
         try:
             with open(media_path, "rb") as f:
-                await _send_media(bot, chat_id, media_type, f, caption)
+                await _send_media(
+                    bot, chat_id, media_type, f, caption,
+                    file_name=file_name, mime_type=mime_type,
+                )
             return
         except Exception as e:
             logger.warning("Не отправил локальное медиа %s: %s", media_path, e)
 
     if media_file_id:
         try:
-            await _send_media(bot, chat_id, media_type, media_file_id, caption)
+            await _send_media(
+                bot, chat_id, media_type, media_file_id, caption,
+                file_name=file_name, mime_type=mime_type,
+            )
             return
         except Exception as e:
             logger.warning("Не отправил медиа по file_id: %s", e)
@@ -951,6 +1080,8 @@ async def on_deleted_business_messages(update: Update, context: ContextTypes.DEF
             thumb_path,
             media_size,
             media_duration,
+            media_file_name,
+            media_mime_type,
             too_big,
             sender_id,
         ) = row
@@ -987,6 +1118,8 @@ async def on_deleted_business_messages(update: Update, context: ContextTypes.DEF
                     thumb_path,
                     thumb_file_id,
                     caption,
+                    media_file_name,
+                    media_mime_type,
                 )
             else:
                 await _send_text_report(context.bot, owner, caption)
