@@ -54,6 +54,7 @@ def init_db():
             sender_name TEXT,
             sender_username TEXT,
             text TEXT,
+            text_label TEXT,
             media_type TEXT,
             media_file_id TEXT,
             media_unique_id TEXT,
@@ -80,6 +81,7 @@ def init_db():
 
     # Миграция старых SQLite-баз без удаления данных.
     message_columns = (
+        "text_label TEXT",
         "media_file_id TEXT",
         "media_unique_id TEXT",
         "media_path TEXT",
@@ -116,6 +118,7 @@ def save_message(**fields):
         "sender_name": "?",
         "sender_username": "",
         "text": "",
+        "text_label": "",
         "media_type": None,
         "media_file_id": None,
         "media_unique_id": None,
@@ -136,12 +139,12 @@ def save_message(**fields):
         """
         INSERT OR REPLACE INTO messages
         (business_connection_id, chat_id, message_id, chat_title,
-         sender_id, sender_name, sender_username, text,
+         sender_id, sender_name, sender_username, text, text_label,
          media_type, media_file_id, media_unique_id, media_path,
          thumb_file_id, thumb_path, media_size, media_duration,
          media_file_name, media_mime_type, too_big, date)
         VALUES (:bc_id, :chat_id, :message_id, :chat_title,
-                :sender_id, :sender_name, :sender_username, :text,
+                :sender_id, :sender_name, :sender_username, :text, :text_label,
                 :media_type, :media_file_id, :media_unique_id, :media_path,
                 :thumb_file_id, :thumb_path, :media_size, :media_duration,
                 :media_file_name, :media_mime_type, :too_big, :date)
@@ -158,7 +161,7 @@ def get_message(bc_id, chat_id, message_id):
         "SELECT text, sender_name, sender_username, chat_title, "
         "media_type, media_file_id, media_unique_id, media_path, "
         "thumb_file_id, thumb_path, media_size, media_duration, "
-        "media_file_name, media_mime_type, too_big, sender_id "
+        "media_file_name, media_mime_type, too_big, sender_id, text_label "
         "FROM messages WHERE business_connection_id=? AND chat_id=? AND message_id=?",
         (bc_id, chat_id, message_id),
     )
@@ -177,7 +180,7 @@ def get_deleted_batch(bc_id, chat_id, message_ids):
         f"SELECT message_id, text, sender_name, sender_username, chat_title, "
         f"media_type, media_file_id, media_path, thumb_file_id, thumb_path, "
         f"media_size, media_duration, media_file_name, media_mime_type, "
-        f"too_big, sender_id "
+        f"too_big, sender_id, text_label "
         f"FROM messages WHERE business_connection_id=? AND chat_id=? "
         f"AND message_id IN ({placeholders})",
         (bc_id, chat_id, *message_ids),
@@ -267,21 +270,27 @@ def describe_special_content(msg):
     """
     Содержимое, которое не текст и не файл: геопозиция, место, контакт,
     опрос, кубик, история, игра, счёт. Без этого при удалении такого
-    сообщения владелец получил бы пустое уведомление — только шапку.
+    сообщения владелец получил бы пустое уведомление, одну шапку.
+
+    Возвращает пару (подпись, содержимое). Подпись уходит отдельной
+    строкой над цитатой, а внутри цитаты остаётся только суть: сверху
+    «📍 Геопозиция:», в цитате сами координаты.
     """
     venue = getattr(msg, "venue", None)
     if venue:
         parts = [getattr(venue, "title", None), getattr(venue, "address", None)]
-        text = "📍 Место: " + ", ".join(p for p in parts if p)
+        body = ", ".join(p for p in parts if p)
         loc = getattr(venue, "location", None)
         if loc:
-            text += f" ({loc.latitude}, {loc.longitude})"
-        return text
+            coords = f"{loc.latitude}, {loc.longitude}"
+            body = f"{body} ({coords})" if body else coords
+        return "📍 Место:", body
 
     loc = getattr(msg, "location", None)
     if loc:
-        live = " · трансляция геопозиции" if getattr(loc, "live_period", None) else ""
-        return f"📍 Геопозиция: {loc.latitude}, {loc.longitude}{live}"
+        live = getattr(loc, "live_period", None)
+        label = "📍 Трансляция геопозиции:" if live else "📍 Геопозиция:"
+        return label, f"{loc.latitude}, {loc.longitude}"
 
     contact = getattr(msg, "contact", None)
     if contact:
@@ -290,30 +299,32 @@ def describe_special_content(msg):
                         getattr(contact, "last_name", None)) if p
         )
         phone = getattr(contact, "phone_number", "") or ""
-        return f"👤 Контакт: {name}{', ' + phone if phone else ''}".strip()
+        return "👤 Контакт:", f"{name}{', ' + phone if phone else ''}".strip()
 
     poll = getattr(msg, "poll", None)
     if poll:
         options = "; ".join(o.text for o in (getattr(poll, "options", None) or []))
-        text = f"📊 Опрос: {getattr(poll, 'question', '')}"
-        return text + (f" — варианты: {options}" if options else "")
+        body = getattr(poll, "question", "") or ""
+        if options:
+            body = f"{body}\nВарианты: {options}" if body else f"Варианты: {options}"
+        return "📊 Опрос:", body
 
     dice = getattr(msg, "dice", None)
     if dice:
-        return f"{getattr(dice, 'emoji', '🎲')} Выпало: {getattr(dice, 'value', '?')}"
+        return f"{getattr(dice, 'emoji', '🎲')} Выпало:", str(getattr(dice, "value", "?"))
 
     if getattr(msg, "story", None):
-        return "📖 История (story)"
+        return "📖 История", ""
 
     game = getattr(msg, "game", None)
     if game:
-        return f"🎮 Игра: {getattr(game, 'title', '')}"
+        return "🎮 Игра:", getattr(game, "title", "") or ""
 
     invoice = getattr(msg, "invoice", None)
     if invoice:
-        return f"🧾 Счёт: {getattr(invoice, 'title', '')}"
+        return "🧾 Счёт:", getattr(invoice, "title", "") or ""
 
-    return ""
+    return "", ""
 
 
 _TG_EMOJI_TAG = re.compile(r"</?tg-emoji[^>]*>")
@@ -340,8 +351,11 @@ def extract_text(msg):
     блок кода и ссылки. python-telegram-bot сам экранирует символы и
     расставляет теги по entities, поэтому результат безопасен.
 
-    Важно: всё, что возвращает эта функция, уже готово к вставке в HTML
-    и повторно НЕ экранируется (иначе теги стали бы видимыми).
+    Важно: текст, который возвращает эта функция, уже готов к вставке в
+    HTML и повторно НЕ экранируется (иначе теги стали бы видимыми).
+
+    Возвращает пару (текст, подпись). Подпись пустая у обычных сообщений
+    и заполнена у геопозиции, контакта, опроса и прочего не-текста.
     """
     raw = None
     try:
@@ -357,9 +371,10 @@ def extract_text(msg):
         raw = html_escape(msg.text or msg.caption)
 
     if raw:
-        return _clean_inner_html(raw)
+        return _clean_inner_html(raw), ""
 
-    return html_escape(describe_special_content(msg))
+    label, body = describe_special_content(msg)
+    return html_escape(body), label
 
 
 # Атрибуты msg, которые могут содержать медиа, и есть ли у них duration/thumbnail.
@@ -453,8 +468,12 @@ def fmt_duration(seconds):
     return f"{m}м {s}с"
 
 
-def media_label(media_type):
-    return {
+def media_label(media_type, with_emoji=True):
+    """
+    Название вида медиа. Без эмодзи оно нужно в строке про вложение:
+    там уже стоит скрепка, и второй значок рядом только мешает.
+    """
+    label = {
         "photo": "📷 фото",
         "video": "🎬 видео",
         "video_note": "⭕ кружок",
@@ -464,6 +483,9 @@ def media_label(media_type):
         "document": "📄 документ",
         "sticker": "🎨 стикер",
     }.get(media_type, media_type)
+    if with_emoji or " " not in (label or ""):
+        return label
+    return label.split(" ", 1)[1]
 
 
 # Официальный аккаунт Telegram с системными уведомлениями (коды входа и т.п.).
@@ -532,6 +554,12 @@ def _user_link(user_id, name):
     if uid:
         return f'<b><a href="tg://user?id={uid}">{display}</a></b>'
     return f"<b>{display}</b>"
+
+
+def _labelled(label, body):
+    """Подпись отдельной строкой, под ней цитата с содержимым."""
+    head = f"{html_escape(label)}\n" if label else ""
+    return head + _quote(body or "[пусто]")
 
 
 def _quote(text, limit=130):
@@ -759,6 +787,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
     user = msg.from_user
+    text_html, text_label = extract_text(msg)
     save_message(
         bc_id=msg.business_connection_id,
         chat_id=msg.chat.id,
@@ -767,7 +796,8 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         sender_id=user.id if user else 0,
         sender_name=user.full_name if user else "?",
         sender_username=(user.username if user else "") or "",
-        text=extract_text(msg),
+        text=text_html,
+        text_label=text_label,
         media_type=info["type"],
         media_file_id=info["file_id"],
         media_unique_id=info["unique_id"],
@@ -796,7 +826,7 @@ async def on_edited_business_message(update: Update, context: ContextTypes.DEFAU
     if _should_ignore_business_message(msg, account_user_id):
         return
 
-    new_text = extract_text(msg)
+    new_text, new_text_label = extract_text(msg)
     new_info = extract_media(msg)
     old = get_message(msg.business_connection_id, msg.chat.id, msg.message_id)
 
@@ -827,6 +857,7 @@ async def on_edited_business_message(update: Update, context: ContextTypes.DEFAU
             old_media_mime_type,
             old_too_big,
             old_sender_id,
+            old_text_label,
         ) = old
 
         text_changed = (old_text or "") != new_text
@@ -848,8 +879,8 @@ async def on_edited_business_message(update: Update, context: ContextTypes.DEFAU
 
             if text_changed or old_text or new_text:
                 report += (
-                    f"\n<b>было</b>\n{_quote(old_text or '[пусто]')}\n"
-                    f"<b>стало</b>\n{_quote(new_text or '[пусто]')}"
+                    f"\n<b>было</b>\n{_labelled(old_text_label, old_text)}\n"
+                    f"<b>стало</b>\n{_labelled(new_text_label, new_text)}"
                 )
 
             try:
@@ -919,6 +950,7 @@ async def on_edited_business_message(update: Update, context: ContextTypes.DEFAU
         sender_name=user.full_name if user else "?",
         sender_username=(user.username if user else "") or "",
         text=new_text,
+        text_label=new_text_label,
         media_type=new_info["type"],
         media_file_id=media_file_id,
         media_unique_id=new_info["unique_id"],
@@ -1195,6 +1227,7 @@ async def on_deleted_business_messages(update: Update, context: ContextTypes.DEF
             media_mime_type,
             too_big,
             sender_id,
+            text_label,
         ) = row
 
         # Защита для старых записей в БД, которые могли попасть туда до обновления фильтра.
@@ -1203,15 +1236,18 @@ async def on_deleted_business_messages(update: Update, context: ContextTypes.DEF
 
         author_link = _user_link(sender_id, sender_name or "")
         caption = f"{author_link}\n<b>удалил(а) сообщение:</b>\n"
+        if text_label:
+            caption += f"{html_escape(text_label)}\n"
         if text:
             caption += f"{_quote(text)}\n"
         if media_type:
-            line = f"\n📎 <b>Медиа:</b> {media_label(media_type)}"
+            parts = [media_label(media_type, with_emoji=False)]
             if media_size:
-                line += f" · {fmt_size(media_size)}"
+                parts.append(fmt_size(media_size))
             if media_duration:
-                line += f" · {fmt_duration(media_duration)}"
-            caption += line
+                parts.append(f"({fmt_duration(media_duration)})")
+            line = "📎 " + " ".join(parts)
+            caption += ("\n" if (text or text_label) else "") + line
 
         try:
             if media_type:
