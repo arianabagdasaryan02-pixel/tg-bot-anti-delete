@@ -7,12 +7,12 @@
 
 import logging
 import os
+import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 
 from telegram import Update
-from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     BusinessConnectionHandler,
@@ -30,12 +30,13 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)  # не писать токен в логи
 
 DB_PATH = "messages.db"
+# Временная папка. Бот создаёт её только тогда, когда пересылка по file_id
+# не прошла: кладёт туда копию, отправляет и сразу удаляет. В обычной
+# работе папка пустая или её нет вообще.
 ARCHIVE_DIR = Path("media_archive")
-ARCHIVE_DIR.mkdir(exist_ok=True)
-
-MAX_DOWNLOAD_SIZE = 20 * 1024 * 1024  # 20 МБ — лимит облачного Bot API для getFile/download
 
 
 # ---------- База ----------
@@ -262,8 +263,103 @@ def html_escape(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def describe_special_content(msg):
+    """
+    Содержимое, которое не текст и не файл: геопозиция, место, контакт,
+    опрос, кубик, история, игра, счёт. Без этого при удалении такого
+    сообщения владелец получил бы пустое уведомление — только шапку.
+    """
+    venue = getattr(msg, "venue", None)
+    if venue:
+        parts = [getattr(venue, "title", None), getattr(venue, "address", None)]
+        text = "📍 Место: " + ", ".join(p for p in parts if p)
+        loc = getattr(venue, "location", None)
+        if loc:
+            text += f" ({loc.latitude}, {loc.longitude})"
+        return text
+
+    loc = getattr(msg, "location", None)
+    if loc:
+        live = " · трансляция геопозиции" if getattr(loc, "live_period", None) else ""
+        return f"📍 Геопозиция: {loc.latitude}, {loc.longitude}{live}"
+
+    contact = getattr(msg, "contact", None)
+    if contact:
+        name = " ".join(
+            p for p in (getattr(contact, "first_name", None),
+                        getattr(contact, "last_name", None)) if p
+        )
+        phone = getattr(contact, "phone_number", "") or ""
+        return f"👤 Контакт: {name}{', ' + phone if phone else ''}".strip()
+
+    poll = getattr(msg, "poll", None)
+    if poll:
+        options = "; ".join(o.text for o in (getattr(poll, "options", None) or []))
+        text = f"📊 Опрос: {getattr(poll, 'question', '')}"
+        return text + (f" — варианты: {options}" if options else "")
+
+    dice = getattr(msg, "dice", None)
+    if dice:
+        return f"{getattr(dice, 'emoji', '🎲')} Выпало: {getattr(dice, 'value', '?')}"
+
+    if getattr(msg, "story", None):
+        return "📖 История (story)"
+
+    game = getattr(msg, "game", None)
+    if game:
+        return f"🎮 Игра: {getattr(game, 'title', '')}"
+
+    invoice = getattr(msg, "invoice", None)
+    if invoice:
+        return f"🧾 Счёт: {getattr(invoice, 'title', '')}"
+
+    return ""
+
+
+_TG_EMOJI_TAG = re.compile(r"</?tg-emoji[^>]*>")
+_ANY_TAG = re.compile(r"<[^>]+>")
+
+
+def _clean_inner_html(html_text):
+    """
+    Готовим разметку собеседника к вставке в нашу цитату:
+    - убираем вложенные <blockquote>: цитата внутри цитаты ломает разметку
+      и Telegram отказывается отправлять сообщение;
+    - разворачиваем <tg-emoji>: кастомные эмодзи бот отправлять не вправе,
+      а внутри тега лежит обычный символ-заменитель, его и оставляем.
+    """
+    for tag in ("<blockquote expandable>", "<blockquote>", "</blockquote>"):
+        html_text = html_text.replace(tag, "")
+    return _TG_EMOJI_TAG.sub("", html_text)
+
+
 def extract_text(msg):
-    return msg.text or msg.caption or ""
+    """
+    Текст СРАЗУ в HTML, чтобы сохранить форматирование собеседника:
+    жирный, курсив, подчёркнутый, зачёркнутый, спойлер, моноширинный,
+    блок кода и ссылки. python-telegram-bot сам экранирует символы и
+    расставляет теги по entities, поэтому результат безопасен.
+
+    Важно: всё, что возвращает эта функция, уже готово к вставке в HTML
+    и повторно НЕ экранируется (иначе теги стали бы видимыми).
+    """
+    raw = None
+    try:
+        if msg.text:
+            raw = msg.text_html
+        elif msg.caption:
+            raw = msg.caption_html
+    except Exception as e:
+        logger.warning("Не разобрал форматирование, беру обычный текст: %s", e)
+        raw = None
+
+    if raw is None and (msg.text or msg.caption):
+        raw = html_escape(msg.text or msg.caption)
+
+    if raw:
+        return _clean_inner_html(raw)
+
+    return html_escape(describe_special_content(msg))
 
 
 # Атрибуты msg, которые могут содержать медиа, и есть ли у них duration/thumbnail.
@@ -321,56 +417,19 @@ def extract_media(msg):
     return info
 
 
-async def download(bot, file_id, media_type, bc_id, chat_id, msg_id, suffix=""):
-    if not file_id:
-        return None
-
-    try:
-        tg_file = await bot.get_file(file_id)
-        dst = ARCHIVE_DIR / f"{bc_id}_{chat_id}_{msg_id}_{media_type}{suffix}"
-        await tg_file.download_to_drive(custom_path=str(dst))
-        return str(dst)
-    except BadRequest as e:
-        logger.info("Файл не скачан через облачный Bot API: %s", e)
-        return None
-    except Exception as e:
-        logger.warning("Не удалось скачать %s: %s", file_id, e)
-        return None
-
-
 async def archive_media_if_possible(bot, info, bc_id, chat_id, msg_id):
-    """Скачать оригинал до 20 МБ и thumbnail/preview, если Telegram его отдал."""
-    media_path = None
-    thumb_path = None
-    too_big = 0
+    """
+    Ничего не качаем и не храним на диске.
 
-    if info["file_id"]:
-        if info["size"] and info["size"] > MAX_DOWNLOAD_SIZE:
-            too_big = 1
-        else:
-            media_path = await download(
-                bot,
-                info["file_id"],
-                info["type"],
-                bc_id,
-                chat_id,
-                msg_id,
-            )
-            if media_path is None and info["size"] > 0:
-                too_big = 1
+    Чтобы отдать владельцу оригинал, боту достаточно file_id: файл уже лежит
+    на серверах Telegram, и пересылка по идентификатору не имеет ограничения
+    по размеру (в отличие от скачивания, где у облачного Bot API потолок 20 МБ).
+    Поэтому локальные копии не нужны: они занимали бы диск, упирались в 20 МБ
+    и требовали отдельной чистки.
 
-        if info["thumb_file_id"]:
-            thumb_path = await download(
-                bot,
-                info["thumb_file_id"],
-                info["type"],
-                bc_id,
-                chat_id,
-                msg_id,
-                suffix="_thumb.jpg",
-            )
-
-    return media_path, thumb_path, too_big
+    Оставлено для совместимости: возвращает пустые пути.
+    """
+    return None, None, 0
 
 
 def fmt_size(size_bytes):
@@ -446,28 +505,49 @@ def _is_target_private_chat(chat) -> bool:
     return bool(chat and str(chat_type).lower().endswith("private"))
 
 
-def _user_link(user_id, name, username=""):
+def _user_link(user_id, name):
     """
-    Безопасное отображение автора.
-    Для пользователей с username НЕ создаём HTML-ссылку https://t.me/username,
-    иначе Telegram добавляет превью карточки снизу. Достаточно обычного @username:
-    Telegram сам сделает его кликабельным.
+    Шапка автора: имя целиком ссылкой на профиль.
+
+    Ссылка всегда ведёт на числовой id (tg://user?id=<id>), а не на юзернейм.
+    Юзернейм человек меняет когда захочет, и старая ссылка после этого ведёт
+    в никуда или, хуже, на чужой профиль, занявший освободившийся хэндл.
+    Числовой id у аккаунта один на всю жизнь.
+
+    Это deep-link, поэтому превью-карточка не появляется (в отличие от
+    https://t.me/...). По документации Telegram такое упоминание
+    гарантированно срабатывает, если человек состоит в чате упоминания или
+    сам писал боту; у владельца оно обычно открывается и без этого, потому
+    что его клиент уже знает пользователя по полученным от него сообщениям.
+
+    Если id почему-то неизвестен, остаётся жирное имя без ссылки.
     """
     try:
         uid = int(user_id) if user_id else 0
     except (TypeError, ValueError):
         uid = 0
 
-    display = html_escape(name or "?")
-    uname = _norm_username(username)
-
-    if uname:
-        return f"{display} (@{html_escape(uname)})"
+    display = html_escape(name or "Пользователь")
 
     if uid:
-        return f'<a href="tg://user?id={uid}">{display}</a>'
+        return f'<b><a href="tg://user?id={uid}">{display}</a></b>'
+    return f"<b>{display}</b>"
 
-    return display
+
+def _quote(text, limit=130):
+    """
+    Текст в цитате. Длинный (или многострочный) — сворачиваемой цитатой
+    <blockquote expandable>, чтобы уведомление не раздувалось.
+
+    Текст уже приходит готовым HTML из extract_text, поэтому здесь его
+    НЕ экранируем — иначе форматирование превратилось бы в видимые теги.
+    Длину считаем по видимым символам, без учёта тегов.
+    """
+    body = text or ""
+    visible = _ANY_TAG.sub("", body)
+    if len(visible) > limit or body.count("\n") >= 3:
+        return f"<blockquote expandable>{body}</blockquote>"
+    return f"<blockquote>{body}</blockquote>"
 
 
 def _is_message_from_bot(msg) -> bool:
@@ -569,18 +649,20 @@ BOT_USERNAME = getattr(config, "BOT_USERNAME", "your_bot_username")
 
 WELCOME_TEXT = (
     "<b>Что умеет этот бот?</b>\n"
-    "🗑 Следить за <b>удалением</b> сообщений — если кто-то удалит сообщение, "
-    "бот пришлёт вам его копию.\n"
-    "✏️ Следить за <b>изменением</b> сообщений — бот пришлёт вам исходное сообщение, "
-    "если его отредактируют.\n"
-    "📷 Сохранять удалённые фото, голосовые и кружочки.\n\n"
-    "<b>Как подключить бота к аккаунту:</b>\n"
-    "1. Перейди в свой профиль\n"
-    "2. Нажми «Изменить»\n"
-    "3. Выбери «Автоматизация чатов»\n"
+    "🗑 Если собеседник удалит сообщение в личной переписке, "
+    "бот пришлёт вам копию.\n"
+    "✏️ Если отредактирует, бот покажет, каким сообщение было до правки.\n"
+    "📎 Вложения возвращает любые: фото, видео, кружочек, голосовое, стикер, "
+    "документ, музыку, геопозицию, контакт, опрос. Размер не важен, "
+    "бот пересылает оригинал, а не копию.\n\n"
+    "<b>Как подключить:</b>\n"
+    "1. Откройте свой профиль\n"
+    "2. Нажмите «Изменить»\n"
+    "3. Выберите «Автоматизация чатов»\n"
     "4. Найдите и добавьте бота:\n"
     f"<blockquote>@{BOT_USERNAME}</blockquote>\n\n"
-    "<i>Необходима последняя версия Telegram</i>"
+    "<i>Нужна последняя версия Telegram и подписка Premium: без неё "
+    "раздела с автоматизацией чатов в профиле не будет.</i>"
 )
 
 WELCOME_VIDEO = "instruction.mp4"  # видео-инструкция, положить рядом с bot.py, необязательно
@@ -752,28 +834,22 @@ async def on_edited_business_message(update: Update, context: ContextTypes.DEFAU
 
         if text_changed or media_changed:
             user = msg.from_user
-            author = (user.full_name if user else None) or old_name or "?"
-            uname = (user.username if user else None) or old_username or ""
+            author = (user.full_name if user else None) or old_name or ""
             sender_id = (user.id if user else None) or old_sender_id or 0
-            author_link = _user_link(sender_id, author, uname)
+            author_link = _user_link(sender_id, author)
 
-            title = "🖼 Медиа изменено" if media_changed else "✏️ Изменённое сообщение"
-            report = (
-                f"<b>{title}</b>\n"
-                f"👤 {author_link}\n"
-            )
+            verb = "заменил(а) медиа" if media_changed and not text_changed else "изменил(а) сообщение"
+            report = f"{author_link}\n<b>{verb}:</b>\n"
 
             if media_changed:
                 old_label = media_label(old_media_type) if old_media_type else "текст"
                 new_label = media_label(new_info["type"]) if new_info["type"] else "текст"
                 report += f"\n🔄 Файл заменён: {old_label} → {new_label}\n"
-                if old_too_big:
-                    report += "<i>Файл больше 20 МБ — отправлен без локальной копии.</i>\n"
 
             if text_changed or old_text or new_text:
                 report += (
-                    f"\n<b>Было:</b>\n<blockquote>{html_escape(old_text or '[пусто]')}</blockquote>\n"
-                    f"<b>Стало:</b>\n<blockquote>{html_escape(new_text or '[пусто]')}</blockquote>"
+                    f"\n<b>было</b>\n{_quote(old_text or '[пусто]')}\n"
+                    f"<b>стало</b>\n{_quote(new_text or '[пусто]')}"
                 )
 
             try:
@@ -1000,54 +1076,89 @@ async def _send_media(bot, chat_id, media_type, source, caption,
     await bot.send_document(chat_id, source, **caption_kwargs, **filename_kwargs)
 
 
+async def _try_download_and_send(bot, chat_id, media_type, file_id, caption,
+                                  file_name=None, mime_type=None):
+    """
+    Запасной путь, когда переслать оригинал по file_id не вышло.
+
+    Такое бывает, если Telegram не принимает файл в исходном виде (например,
+    особый стикер). Файл при этом на серверах есть, значит его можно скачать
+    и отправить уже своей копией. Работает для файлов до 20 МБ — выше этого
+    Telegram скачивать боту не даёт.
+
+    Копия временная: сразу после отправки удаляем, чтобы диск не рос.
+    """
+    if not file_id:
+        return False
+
+    tmp = None
+    try:
+        ARCHIVE_DIR.mkdir(exist_ok=True)
+        tg_file = await bot.get_file(file_id)
+        tmp = ARCHIVE_DIR / f"tmp_{file_id[:24]}"
+        await tg_file.download_to_drive(custom_path=str(tmp))
+        with open(tmp, "rb") as f:
+            await _send_media(bot, chat_id, media_type, f, caption,
+                              file_name=file_name, mime_type=mime_type)
+        logger.info("Отправил копией: %s", media_type)
+        return True
+    except Exception as e:
+        logger.warning("Запасная отправка копией не удалась (%s): %s", media_type, e)
+        return False
+    finally:
+        try:
+            if tmp is not None and tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
 async def _send_stored_media(bot, chat_id, media_type, media_path, media_file_id,
                               thumb_path, thumb_file_id, caption,
                               file_name=None, mime_type=None):
     """
-    Порядок отправки:
-    1. локально сохранённый оригинал;
-    2. оригинал по file_id, если файл был больше 20 МБ или не скачался;
-    3. локальное preview/thumbnail;
-    4. preview/thumbnail по file_id;
-    5. только текстовый отчёт.
+    Порядок попыток:
+    1. переслать оригинал по file_id — работает для любого размера и
+       ничего не качает;
+    2. если не вышло — скачать копию и отправить её (до 20 МБ), копию
+       после отправки удалить;
+    3. копия на диске от прежних версий бота, если осталась;
+    4. превью;
+    5. если ничего не получилось — текст и честное пояснение.
     """
+    if media_file_id:
+        try:
+            await _send_media(bot, chat_id, media_type, media_file_id, caption,
+                              file_name=file_name, mime_type=mime_type)
+            return
+        except Exception as e:
+            logger.warning("Не переслал оригинал по file_id (%s): %s", media_type, e)
+
+        if await _try_download_and_send(bot, chat_id, media_type, media_file_id,
+                                        caption, file_name, mime_type):
+            return
+
     if media_path and os.path.exists(media_path):
         try:
             with open(media_path, "rb") as f:
-                await _send_media(
-                    bot, chat_id, media_type, f, caption,
-                    file_name=file_name, mime_type=mime_type,
-                )
+                await _send_media(bot, chat_id, media_type, f, caption,
+                                  file_name=file_name, mime_type=mime_type)
             return
         except Exception as e:
-            logger.warning("Не отправил локальное медиа %s: %s", media_path, e)
-
-    if media_file_id:
-        try:
-            await _send_media(
-                bot, chat_id, media_type, media_file_id, caption,
-                file_name=file_name, mime_type=mime_type,
-            )
-            return
-        except Exception as e:
-            logger.warning("Не отправил медиа по file_id: %s", e)
-
-    if thumb_path and os.path.exists(thumb_path):
-        try:
-            with open(thumb_path, "rb") as f:
-                await _send_media(bot, chat_id, "photo", f, caption)
-            return
-        except Exception as e:
-            logger.warning("Не отправил локальный thumbnail %s: %s", thumb_path, e)
+            logger.warning("Не отправил копию с диска %s: %s", media_path, e)
 
     if thumb_file_id:
         try:
             await _send_media(bot, chat_id, "photo", thumb_file_id, caption)
             return
         except Exception as e:
-            logger.warning("Не отправил thumbnail по file_id: %s", e)
+            logger.warning("Не отправил превью: %s", e)
 
-    await _send_text_report(bot, chat_id, caption)
+    logger.warning("Файл не удалось отдать никак: тип=%s", media_type)
+    await _send_text_report(
+        bot, chat_id,
+        caption + "\n<i>Сам файл получить не удалось: Telegram больше его не отдаёт.</i>",
+    )
 
 
 async def on_deleted_business_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1090,13 +1201,10 @@ async def on_deleted_business_messages(update: Update, context: ContextTypes.DEF
         if _safe_int(sender_id) == TELEGRAM_SERVICE_ACCOUNT_ID or _looks_like_bot_username(sender_username):
             continue
 
-        author_link = _user_link(sender_id, sender_name or "?", sender_username or "")
-        caption = (
-            f"🗑 <b>Удалённое сообщение</b>\n"
-            f"👤 {author_link}\n"
-        )
+        author_link = _user_link(sender_id, sender_name or "")
+        caption = f"{author_link}\n<b>удалил(а) сообщение:</b>\n"
         if text:
-            caption += f"\n<b>Текст:</b>\n<blockquote>{html_escape(text)}</blockquote>\n"
+            caption += f"{_quote(text)}\n"
         if media_type:
             line = f"\n📎 <b>Медиа:</b> {media_label(media_type)}"
             if media_size:
@@ -1104,8 +1212,6 @@ async def on_deleted_business_messages(update: Update, context: ContextTypes.DEF
             if media_duration:
                 line += f" · {fmt_duration(media_duration)}"
             caption += line
-            if too_big:
-                caption += "\n<i>Файл больше 20 МБ — отправлен без локальной копии.</i>"
 
         try:
             if media_type:
@@ -1143,7 +1249,7 @@ def main():
     app.add_handler(MessageHandler(filters.UpdateType.EDITED_BUSINESS_MESSAGE, on_edited_business_message))
     app.add_handler(BusinessMessagesDeletedHandler(on_deleted_business_messages))
 
-    logger.info("Бот запущен: Business API, архив до 20 МБ, file_id/preview для больших файлов.")
+    logger.info("Бот запущен: Business API, оригиналы пересылаются по file_id, копии на диске не хранятся.")
     app.run_polling(
         allowed_updates=[
             "message",

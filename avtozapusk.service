@@ -1,0 +1,18 @@
+[Unit]
+Description=Telegram anti-delete bot — автозапуск
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+WorkingDirectory=/home/botuser/bot
+ExecStart=/home/botuser/bot/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+# Раз в сутки systemd гасит бота и поднимает заново.
+# Страховка от зависания: процесс жив, но ничего не делает.
+RuntimeMaxSec=1d
+
+[Install]
+WantedBy=multi-user.target
