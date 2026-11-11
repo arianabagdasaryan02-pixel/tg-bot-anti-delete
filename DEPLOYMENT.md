@@ -24,14 +24,15 @@
 git clone https://github.com/arianabagdasaryan02-pixel/tg-bot-anti-delete.git
 cd tg-bot-anti-delete
 
-python -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt
+py -m venv venv
+venv\Scripts\python -m pip install -r requirements.txt
 
 copy config.example.py config.py
 notepad config.py   # впиши BOT_TOKEN и BOT_USERNAME
-python bot.py
+venv\Scripts\python bot.py
 ```
+
+Путь перед `python` не опечатка: так вызывается Python из папки `venv`, и активировать окружение не нужно. Команда активации в Windows разная для `cmd` и PowerShell, а при ошибке срабатывает молча, поэтому надёжнее обойтись без неё.
 
 Без `git` можно скачать ZIP: на странице репозитория «Code» → «Download ZIP» → распаковать.
 
