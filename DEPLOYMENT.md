@@ -2,6 +2,8 @@
 
 Разбор всех способов развернуть бота — от локального теста до продакшена на VPS.
 
+> ℹ️ **Перед запуском:** у бота должен быть включён **Secretary Mode** в [@BotFather](https://t.me/BotFather), иначе Telegram не даст подключить его к аккаунту. Как это сделать, описано в [README](README.md#4-включите-режим-секретаря).
+
 > ⚠️ **Важная особенность Telegram Business API:** Telegram хранит входящие события, пока бот их не заберёт, но **не дольше 24 часов**. Если бот выключен дольше суток — пропущенные за это время удаления и правки теряются. Поэтому для полноценной работы нужен постоянно запущенный бот (24/7).
 
 ---
@@ -41,8 +43,8 @@ python --version
 
 Через git:
 ```powershell
-git clone https://github.com/<username>/<repo>.git
-cd <repo>
+git clone https://github.com/arianabagdasaryan02-pixel/tg-bot-anti-delete.git
+cd tg-bot-anti-delete
 ```
 
 Или скачай ZIP с GitHub → «Code» → «Download ZIP» → распакуй.
@@ -91,8 +93,8 @@ python3 --version
 **2. Скачай код и настрой:**
 
 ```bash
-git clone https://github.com/<username>/<repo>.git
-cd <repo>
+git clone https://github.com/arianabagdasaryan02-pixel/tg-bot-anti-delete.git
+cd tg-bot-anti-delete
 
 python3 -m venv venv
 source venv/bin/activate
@@ -199,7 +201,7 @@ su - botuser
 
 ```bash
 cd ~
-git clone https://github.com/<username>/<repo>.git bot
+git clone https://github.com/arianabagdasaryan02-pixel/tg-bot-anti-delete.git bot
 cd bot
 
 python3 -m venv venv
@@ -222,53 +224,34 @@ python bot.py
 
 **7. Настрой автозапуск через systemd**
 
-Вернись под root:
+В проекте уже лежит готовый файл службы `avtozapusk.service`. Не пиши свой: два разных сервиса с одним токеном Telegram не разрешит, и обе копии начнут выбивать друг друга из связи.
+
+Вернись под root и скопируй файл:
 ```bash
 exit  # выходим из botuser обратно в root
-```
 
-Создай сервис:
-```bash
-nano /etc/systemd/system/tgbot.service
-```
-
-Вставь:
-```ini
-[Unit]
-Description=Telegram Business Bot
-After=network.target
-
-[Service]
-Type=simple
-User=botuser
-WorkingDirectory=/home/botuser/bot
-ExecStart=/home/botuser/bot/venv/bin/python bot.py
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Сохрани (Ctrl+O, Enter, Ctrl+X). Запусти:
-
-```bash
+cp /home/botuser/bot/avtozapusk.service /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable tgbot
-systemctl start tgbot
+systemctl enable --now avtozapusk
 ```
 
 Проверь:
 ```bash
-systemctl status tgbot
+systemctl status avtozapusk
 ```
 
-Должно быть `active (running)`. Теперь бот перезапустится сам при падении и при перезагрузке сервера.
+Должно быть `active (running)`. Теперь бот поднимется сам и при падении, и при перезагрузке сервера.
+
+Внутри файла стоит `RuntimeMaxSec=1d`: раз в сутки systemd перезапустит бота. Это страховка на случай, когда процесс жив, но перестал отвечать.
+
+Если ты поставил бота не в `/home/botuser/bot` или под другим пользователем, поправь в файле `User`, `WorkingDirectory` и `ExecStart`.
 
 Логи смотреть так:
 ```bash
-journalctl -u tgbot -f
+journalctl -u avtozapusk -f
 ```
+
+---
 
 **8. Настрой автоочистку через cron**
 
@@ -277,12 +260,14 @@ su - botuser
 crontab -e
 ```
 
-Добавь строку (каждый день в 03:00):
+Добавь строку (каждый день в 04:00):
 ```
-0 3 * * * cd /home/botuser/bot && /home/botuser/bot/venv/bin/python cleanup.py >> cleanup.log 2>&1
+0 4 * * * cd /home/botuser/bot && /home/botuser/bot/venv/bin/python cleanup.py >> cleanup.log 2>&1
 ```
 
 Сохрани и выйди.
+
+По умолчанию бот помнит сутки. Чтобы хранить дольше, добавь в `config.py` строку вида `DAYS_TO_KEEP = 7`. Подробнее в [README](README.md).
 
 **Готово.** Бот работает 24/7, перезапускается при сбоях, каждую ночь чистит старые данные.
 
@@ -297,7 +282,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 exit
 # перезапуск сервиса под root:
-systemctl restart tgbot
+systemctl restart avtozapusk
 ```
 
 ---
@@ -324,10 +309,10 @@ systemctl restart tgbot
 
 ### Railway (railway.app)
 
-Западный сервис. Бесплатно даёт $5 кредита в месяц — на маленького бота хватает.
+Западный сервис. Новому аккаунту даётся разовый кредит $5 без ввода карты. Дальше либо тариф Hobby за $5 в месяц, либо бесплатный план примерно с $1 кредита в месяц, чего круглосуточному боту не хватит.
 
-Плюсы: удобный веб-интерфейс, автодеплой из GitHub.
-Минусы: нужна иностранная карта для верификации, интерфейс на английском.
+Плюсы: удобный веб-интерфейс, автодеплой из GitHub, сервисы не засыпают при простое.
+Минусы: постоянная работа упирается в платный тариф, нужна иностранная карта, интерфейс на английском.
 
 ### Render (render.com)
 
@@ -337,7 +322,7 @@ systemctl restart tgbot
 
 ### PythonAnywhere (pythonanywhere.com)
 
-Специализированный хостинг для Python. Бесплатный тариф имеет ограничения на исходящие HTTP-запросы (белый список доменов) — Telegram API там есть, но `getFile` для больших медиа может не работать.
+Специализированный хостинг для Python. На бесплатном тарифе исходящие запросы разрешены только к доменам из белого списка, Telegram API в нём есть. Боту этого достаточно: он не скачивает файлы, а просит Telegram переслать оригинал по его номеру.
 
 ### Общее правило для бесплатных хостингов
 
@@ -387,7 +372,8 @@ sudo systemctl restart systemd-logind
 | Свой компьютер | 0₽ | ❌ Только при включённом ПК | 🟢 Легко | Тест, разработка |
 | VPS | 150-500₽/мес | ✅ Да | 🟡 Средне | Постоянная работа |
 | Bothost / Amvera | 0-300₽/мес | ✅ Да (проверь SLA) | 🟢 Легко | Новички без Linux |
-| Railway / Render | $0-5/мес | ⚠️ Могут «засыпать» | 🟢 Легко | Не подходит для Business API |
+| Railway | от $5/мес | ✅ Да, не засыпает | 🟢 Легко | Если есть иностранная карта |
+| Render | только платный | ❌ На бесплатном засыпает | 🟢 Легко | На бесплатном не подходит |
 | Raspberry Pi | ~5 000₽ разово | ✅ Пока есть свет | 🟡 Средне | Энтузиасты |
 | Старый ноут | 0₽ | ✅ Пока не сломается | 🟡 Средне | Есть лишнее железо |
 
